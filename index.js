@@ -12,8 +12,7 @@ app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
 // ---------------- ADMIN CHECK MIDDLEWARE ----------------
-// Simple header-based admin check (expects header 'role: admin')
-// In production use proper auth & role check
+
 const verifyAdmin = (req, res, next) => {
   const role = req.headers.role;
   if (role === 'admin') return next();
@@ -26,6 +25,7 @@ const verifyAdmin = (req, res, next) => {
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@${
   process.env.DB_HOST || 'cluster0.2gqzmaz.mongodb.net'
 }/?appName=${process.env.DB_APP_NAME || 'Cluster0'}`;
+
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -42,6 +42,8 @@ async function run() {
     const doctorCollection = db.collection('doctors');
     const userCollection = db.collection('users');
     const appointmentCollection = db.collection('appointments');
+    const medicineCollection = db.collection('medicines'); // 🧪 new
+    const orderCollection = db.collection('orders'); // 🧾 new
 
     console.log('✔ MongoDB Connected Successfully!');
 
@@ -184,12 +186,10 @@ async function run() {
           !appointment?.doctorId ||
           !appointment?.appointmentDate
         ) {
-          return res
-            .status(400)
-            .json({
-              success: false,
-              message: 'userId, doctorId and appointmentDate are required',
-            });
+          return res.status(400).json({
+            success: false,
+            message: 'userId, doctorId and appointmentDate are required',
+          });
         }
 
         // Save userId and doctorId as strings so frontend (string IDs) will match queries.
@@ -242,6 +242,204 @@ async function run() {
       try {
         const appointments = await appointmentCollection.find().toArray();
         res.json(appointments);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // ---------------- MEDICINES ----------------
+
+    // Add new medicine (admin only) (POST /medicines)
+    app.post('/medicines', verifyAdmin, async (req, res) => {
+      try {
+        const { name, category, price, stock, description, image } = req.body;
+
+        if (!name || price === undefined || price === '') {
+          return res.status(400).json({
+            success: false,
+            message: 'name and price are required',
+          });
+        }
+
+        const doc = {
+          name,
+          category: category || '',
+          price: Number(price),
+          stock: stock !== undefined && stock !== '' ? Number(stock) : 0,
+          description: description || '',
+          image: image || '',
+          createdAt: new Date(),
+        };
+
+        const result = await medicineCollection.insertOne(doc);
+        res.json({ success: true, result });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // Get all medicines (GET /medicines)
+    app.get('/medicines', async (req, res) => {
+      try {
+        const medicines = await medicineCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(medicines);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // Search medicines (GET /medicines/search?search=...)
+    app.get('/medicines/search', async (req, res) => {
+      try {
+        const search = (req.query.search || '').trim();
+
+        const filter = search
+          ? {
+              $or: [
+                { name: { $regex: search, $options: 'i' } },
+                { category: { $regex: search, $options: 'i' } },
+                { description: { $regex: search, $options: 'i' } },
+              ],
+            }
+          : {};
+
+        const medicines = await medicineCollection
+          .find(filter)
+          .sort({ createdAt: -1 })
+          .toArray();
+
+        res.json(medicines);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // Get single medicine by ID (GET /medicines/:id)
+    app.get('/medicines/:id', async (req, res) => {
+      try {
+        let id;
+        try {
+          id = new ObjectId(req.params.id);
+        } catch {
+          return res
+            .status(400)
+            .json({ success: false, message: 'Invalid medicine id' });
+        }
+
+        const medicine = await medicineCollection.findOne({ _id: id });
+        if (!medicine) {
+          return res
+            .status(404)
+            .json({ success: false, message: 'Medicine not found' });
+        }
+        res.json(medicine);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // ---------------- ORDERS ----------------
+
+    // Create order (POST /orders)
+    // Expected body: { userId, medicineId, quantity }
+    app.post('/orders', async (req, res) => {
+      try {
+        const { userId, medicineId, quantity } = req.body;
+
+        if (!userId || !medicineId || quantity === undefined) {
+          return res.status(400).json({
+            success: false,
+            message: 'userId, medicineId and quantity are required',
+          });
+        }
+
+        const qty = Number(quantity);
+        if (isNaN(qty) || qty <= 0) {
+          return res.status(400).json({
+            success: false,
+            message: 'quantity must be a positive number',
+          });
+        }
+
+        let medicineObjectId;
+        try {
+          medicineObjectId = new ObjectId(medicineId);
+        } catch {
+          return res
+            .status(400)
+            .json({ success: false, message: 'Invalid medicineId' });
+        }
+
+        // Decrease stock atomically only if enough stock is available
+        const updateResult = await medicineCollection.updateOne(
+          { _id: medicineObjectId, stock: { $gte: qty } },
+          { $inc: { stock: -qty } }
+        );
+
+        if (updateResult.modifiedCount === 0) {
+          return res.status(400).json({
+            success: false,
+            message: 'Medicine not found or insufficient stock',
+          });
+        }
+
+        // Get latest medicine info for price
+        const medicine = await medicineCollection.findOne({
+          _id: medicineObjectId,
+        });
+
+        const orderDoc = {
+          userId: String(userId),
+          medicineId: String(medicineId),
+          quantity: qty,
+          pricePerUnit: medicine?.price ?? null,
+          totalPrice:
+            medicine && typeof medicine.price === 'number'
+              ? medicine.price * qty
+              : null,
+          status: 'placed',
+          createdAt: new Date(),
+        };
+
+        const result = await orderCollection.insertOne(orderDoc);
+        res.json({ success: true, result });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // Get orders by user ID (GET /orders/user/:userId)
+    app.get('/orders/user/:userId', async (req, res) => {
+      try {
+        const userId = String(req.params.userId);
+        const orders = await orderCollection
+          .find({ userId })
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(orders);
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, message: err.message });
+      }
+    });
+
+    // Get all orders (admin only) (GET /orders)
+    app.get('/orders', verifyAdmin, async (req, res) => {
+      try {
+        const orders = await orderCollection
+          .find()
+          .sort({ createdAt: -1 })
+          .toArray();
+        res.json(orders);
       } catch (err) {
         console.error(err);
         res.status(500).json({ success: false, message: err.message });
